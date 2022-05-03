@@ -69,6 +69,30 @@ class Agent(Serializable):
 
             return action
 
+    def draw_noisy_action(self, state):
+        """
+        Return the noisy action to execute in the given state. It is the action
+        returned by the policy or the action set by the algorithm (e.g. in the
+        case of SARSA).
+
+        Args:
+            state (np.ndarray): the state where the agent is.
+
+        Returns:
+            The action to be executed.
+
+        """
+        if self.phi is not None:
+            state = self.phi(state)
+
+        if self.next_action is None:
+            return self.policy.draw_noisy_action(state)
+        else:
+            action = self.next_action
+            self.next_action = None
+
+            return action
+
     def episode_start(self):
         """
         Called by the agent when a new episode starts.
