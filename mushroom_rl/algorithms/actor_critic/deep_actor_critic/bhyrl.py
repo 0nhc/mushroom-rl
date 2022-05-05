@@ -110,6 +110,8 @@ class BHyRLPolicy(Policy):
             _mu_approximator='mushroom',
             _sigma_approximator='mushroom',
             _discrete_approximator='mushroom',
+            _max_a='numpy',
+            _min_a='numpy',
             _delta_a='torch',
             _central_a='torch',
             _log_std_min='mushroom',
@@ -125,6 +127,22 @@ class BHyRLPolicy(Policy):
     def draw_action(self, state):
         return self.compute_action_and_log_prob_t(
             state, compute_log_prob=False).detach().cpu().numpy()
+
+    def draw_deterministic_action(self, state):
+        # Continuous        
+        cont_mu_raw = self._mu_approximator.predict(state, output_tensor=True)
+        a_cont = torch.tanh(cont_mu_raw)
+        a_cont_true = a_cont * self._delta_a + self._central_a
+        # Discrete
+        # NOTE: Discrete approximator takes both state and continuous action as input (sequential policy)
+        if isinstance(state, np.ndarray):
+            if self._mu_approximator.model.use_cuda:
+                state = torch.from_numpy(state).cuda()
+            else:
+                state = torch.from_numpy(state)
+        logits = self._discrete_approximator.predict(torch.hstack((state, a_cont_true.detach())), output_tensor=True)
+        a_discrete = F.one_hot(torch.argmax(logits, dim=-1), logits.shape[-1])
+        return torch.hstack((a_cont_true, a_discrete)).detach().cpu().numpy()
 
     def draw_noisy_action(self, state):
         # Add clipped gaussian noise (only to the continuous actions!)
@@ -479,7 +497,6 @@ class BHyRL(DeepAC):
                 # # Fitting a 'residual q' i.e 'rho'. So we subtract the prior_rho values
                 # Use weights for the prior rho values. Also use appropriate state-spaces as per the prior task
                 weights, prior_state =  self._mdp_get_prior_state_fn(state, ik_task=(idx==0)) # task[0] is an IK prior task
-                # import pdb; pdb.set_trace()
                 rho_prior = weights*prior_critic.predict(prior_state, action, prediction='min')
                 rho -= rho_prior # subtract the prior_rho value
             

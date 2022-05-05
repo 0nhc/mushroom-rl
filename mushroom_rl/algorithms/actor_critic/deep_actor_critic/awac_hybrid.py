@@ -107,6 +107,8 @@ class AWAC_hybridPolicy(Policy):
             _mu_approximator='mushroom',
             _sigma_approximator='mushroom',
             _discrete_approximator='mushroom',
+            _max_a='numpy',
+            _min_a='numpy',
             _delta_a='torch',
             _central_a='torch',
             _log_std_min='mushroom',
