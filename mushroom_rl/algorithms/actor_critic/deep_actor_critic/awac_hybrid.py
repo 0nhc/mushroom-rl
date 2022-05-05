@@ -302,7 +302,7 @@ class AWAC_hybrid(DeepAC):
                  actor_optimizer, critic_params, batch_size,
                  initial_replay_size, max_replay_size, warmup_transitions, tau,
                  log_std_min=-20, log_std_max=2, temperature=1.0, gauss_noise_cov=0.0,
-                 critic_fit_params=None):
+                 prior_agent_to_reuse=None, critic_fit_params=None):
         """
         Constructor.
 
@@ -329,6 +329,7 @@ class AWAC_hybrid(DeepAC):
             log_std_max ([float, Parameter]): Max value for the policy log std;
             temperature (float): the temperature for the softmax part of the gumbel reparametrization
             gauss_noise_cov ([float, Parameter]): Add gaussian noise to the drawn actions (if calling 'draw_noisy_action()')
+            prior_agent_to_reuse: (Optional) prior agent to continue training with
             critic_fit_params (dict, None): parameters of the fitting algorithm
                 of the critic approximator.
 
@@ -348,9 +349,14 @@ class AWAC_hybrid(DeepAC):
             critic_params['n_models'] = 2
 
         target_critic_params = deepcopy(critic_params)
-        self._critic_approximator = Regressor(TorchApproximator,
+        if(prior_agent_to_reuse is not None):
+            # Continue training with the prior agent's Q function
+            self._critic_approximator = prior_agent_to_reuse._critic_approximator
+            self._target_critic_approximator = prior_agent_to_reuse._target_critic_approximator
+        else:
+            self._critic_approximator = Regressor(TorchApproximator,
                                               **critic_params)
-        self._target_critic_approximator = Regressor(TorchApproximator,
+            self._target_critic_approximator = Regressor(TorchApproximator,
                                                      **target_critic_params)
 
         actor_mu_approximator = Regressor(TorchApproximator,

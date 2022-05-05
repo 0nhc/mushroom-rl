@@ -130,6 +130,22 @@ class SAC_hybridPolicy(Policy):
         # Dummy call to draw_action
         return self.draw_action(state)
 
+    def draw_action_mean_and_logits(self, state):
+        # Continuous
+        cont_mu_raw = self._mu_approximator.predict(state, output_tensor=True)
+        a_cont = torch.tanh(cont_mu_raw)
+        a_cont_true = a_cont * self._delta_a + self._central_a
+        # Discrete
+        # NOTE: Discrete approximator takes both state and continuous action as input (sequential policy)
+        if isinstance(state, np.ndarray):
+            if self._mu_approximator.model.use_cuda:
+                state = torch.from_numpy(state).cuda()
+            else:
+                state = torch.from_numpy(state)
+        logits = self._discrete_approximator.predict(torch.hstack((state, a_cont_true.detach())), output_tensor=True)
+
+        return a_cont_true.detach(), logits.detach()
+    
     def compute_action_and_log_prob(self, state):
         """
         Function that samples actions using the reparametrization trick and
@@ -310,7 +326,7 @@ class SAC_hybrid(DeepAC):
                  initial_replay_size, max_replay_size, warmup_transitions, tau,
                  lr_alpha, log_std_min=-20, log_std_max=2, temperature=1.0, target_entropy=None, 
                  prior_agents=None, mdp_get_prior_state_fn=None, use_kl_on_q=False, kl_on_q_alpha=1e-3,
-                 use_kl_on_pi=False, kl_on_pi_alpha=1e-3, critic_fit_params=None):
+                 use_kl_on_pi=False, kl_on_pi_alpha=1e-3, prior_agent_to_reuse=None, critic_fit_params=None):
         """
         Constructor.
 
@@ -345,6 +361,7 @@ class SAC_hybrid(DeepAC):
             kl_on_q_alpha (float): Alpha parameter to weight the KL divergence reward
             use_kl_on_pi (bool): Whether to use a kl between the prior task policy and the new policy as a loss on the policy
             kl_on_pi_alpha (float): Alpha parameter to weight the KL divergence loss on the policy
+            prior_agent_to_reuse: (Optional) prior agent to continue training with
             critic_fit_params (dict, None): parameters of the fitting algorithm
                 of the critic approximator.
 
@@ -368,9 +385,14 @@ class SAC_hybrid(DeepAC):
             critic_params['n_models'] = 2
 
         target_critic_params = deepcopy(critic_params)
-        self._critic_approximator = Regressor(TorchApproximator,
+        if(prior_agent_to_reuse is not None):
+            # Continue training with the prior agent's Q function
+            self._critic_approximator = prior_agent_to_reuse._critic_approximator
+            self._target_critic_approximator = prior_agent_to_reuse._target_critic_approximator
+        else:
+            self._critic_approximator = Regressor(TorchApproximator,
                                               **critic_params)
-        self._target_critic_approximator = Regressor(TorchApproximator,
+            self._target_critic_approximator = Regressor(TorchApproximator,
                                                      **target_critic_params)
         
         self._prior_critic_approximators = list()
@@ -455,7 +477,7 @@ class SAC_hybrid(DeepAC):
                 curr_multiv_cont_dist = torch.distributions.MultivariateNormal(curr_cont_dist.mean, torch.diag_embed(curr_cont_dist.variance))
                 # TODO: Add discrete discrete distribution for KL calculation
                 # Use Forward KL instead of reverse KL because prior policy distribution could be peaky
-                self._kl_with_prior_t = torch.tensor(weights, device=prior_cont_dist.mean.device)*torch.distributions.kl.kl_divergence(curr_multiv_cont_dist,prior_multiv_cont_dist) # USE REVERSE KL INSTEAD!
+                self._kl_with_prior_t = torch.tensor(weights, device=prior_cont_dist.mean.device)*torch.distributions.kl.kl_divergence(prior_multiv_cont_dist,curr_multiv_cont_dist)
                 self._kl_with_prior = self._kl_with_prior_t.detach().cpu().numpy()
 
             if self._replay_memory.size > self._warmup_transitions():
