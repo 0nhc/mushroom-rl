@@ -15,7 +15,9 @@ from mushroom_rl.utils.parameters import to_parameter
 from copy import deepcopy
 from itertools import chain
 
-# SAC With a Hybrid action space (A sequential discrete approximator takes as input the continous action and outputs the discrete part of the action)
+# RPL: Residual Policy Learning
+# Action space is hybrid (A sequential discrete approximator takes as input the continous action and outputs the discrete part of the action)
+# Residual Policy Learning as introduced in Silver, Tom, et al. 2018, https://arxiv.org/pdf/1812.06298.pdf
 
 class GumbelSoftmax(torch.distributions.RelaxedOneHotCategorical):
     '''
@@ -56,17 +58,14 @@ class GumbelSoftmax(torch.distributions.RelaxedOneHotCategorical):
         return -p_log_p.sum(-1)
 
 
-class SAC_hybridPolicy(Policy):
+class RPLPolicy(Policy):
     """
-    Class used to implement the policy used by the Soft Actor-Critic
-    algorithm. The policy is a Gaussian policy squashed by a tanh.
-    This class implements the compute_action_and_log_prob and the
-    compute_action_and_log_prob_t methods, that are fundamental for
-    the internals calculations of the SAC algorithm.
+    The policy is a Gaussian policy squashed by a tanh. Policies are residuals i.e. they stack.
 
     """
     def __init__(self, mu_approximator, sigma_approximator, discrete_approximator,
-                 min_a, max_a, log_std_min, log_std_max, temperature=1.0):
+                 min_a, max_a, log_std_min, log_std_max, temperature, gauss_noise_cov,
+                 prior_policies, mdp_get_prior_state_fn, logit_max, logit_min, start_residual):
         """
         Constructor.
 
@@ -83,7 +82,12 @@ class SAC_hybridPolicy(Policy):
                 for each component.
             log_std_min ([float, Parameter]): min value for the policy log std;
             log_std_max ([float, Parameter]): max value for the policy log std;
-            temperature ([float]): temperature for the Gumbel Softmax.
+            temperature ([float]): temperature for the Gumbel Softmax;
+            gauss_noise_cov ([float]): Add gaussian noise to the drawn actions (if calling 'draw_noisy_action()')
+            prior_policies: (Optional) previous policies to use for learning a residual policy on top
+            logit_max ([float, Parameter]): Max value for the policy discrete logits
+            logit_min ([float, Parameter]): Min value for the policy discrete logits
+            start_residual (bool): Flag to start using (and training) the residual policy
 
         """
         self._mu_approximator = mu_approximator
@@ -91,6 +95,7 @@ class SAC_hybridPolicy(Policy):
         self._discrete_approximator = discrete_approximator
         
         self._temperature = torch.tensor(temperature)
+        self._gauss_noise_cov = np.array(gauss_noise_cov)
         self._max_a = max_a[:mu_approximator.output_shape[0]]
         self._min_a = min_a[:mu_approximator.output_shape[0]]
         self._delta_a = to_float_tensor(.5 * (self._max_a - self._min_a), self.use_cuda)
@@ -98,6 +103,8 @@ class SAC_hybridPolicy(Policy):
 
         self._log_std_min = to_parameter(log_std_min)
         self._log_std_max = to_parameter(log_std_max)
+        self._logit_max = to_parameter(logit_max)
+        self._logit_min = to_parameter(logit_min)
 
         self._eps_log_prob = 1e-6
 
@@ -107,16 +114,29 @@ class SAC_hybridPolicy(Policy):
             self._delta_a = self._delta_a.cuda()
             self._central_a = self._central_a.cuda()
 
+        self._prior_policies = list()
+        if (prior_policies is not None):
+            self._prior_policies = prior_policies
+        self._mdp_get_prior_state_fn = mdp_get_prior_state_fn
+
+        self._start_residual = start_residual
+
         self._add_save_attr(
             _mu_approximator='mushroom',
             _sigma_approximator='mushroom',
             _discrete_approximator='mushroom',
+            _max_a='numpy',
+            _min_a='numpy',
             _delta_a='torch',
             _central_a='torch',
             _log_std_min='mushroom',
             _log_std_max='mushroom',
             _eps_log_prob='primitive',
-            _temperature='torch'
+            _temperature='torch',
+            _gauss_noise_cov='numpy',
+            _logit_max='mushroom',
+            _logit_min='mushroom',
+            _start_residual='primitive'
         )
 
     def __call__(self, state, action):
@@ -127,8 +147,10 @@ class SAC_hybridPolicy(Policy):
             state, compute_log_prob=False).detach().cpu().numpy()
 
     def draw_noisy_action(self, state):
-        # Dummy call to draw_action
-        return self.draw_action(state)
+        # Add clipped gaussian noise (only to the continuous actions!)
+        cont_noise = np.random.multivariate_normal(np.zeros(self._mu_approximator.output_shape[0]),np.eye(self._mu_approximator.output_shape[0])*self._gauss_noise_cov)
+        noise = np.hstack((cont_noise,np.zeros(self._discrete_approximator.output_shape[0])))
+        return np.clip(self.compute_action_and_log_prob_t(state, compute_log_prob=False).detach().cpu().numpy() + noise, np.hstack((self._min_a,np.zeros(self._discrete_approximator.output_shape[0]))), np.hstack((self._max_a,np.ones(self._discrete_approximator.output_shape[0]))))
 
     def draw_action_mean_and_logits(self, state):
         # Continuous
@@ -184,8 +206,30 @@ class SAC_hybridPolicy(Policy):
 
         # Discrete
         # NOTE: Discrete approximator takes both state and continuous action as input (sequential policy)
-        discrete_dist = self.discrete_distribution(state, a_cont_true.detach()) # detach to avoid gradients of continuous through here
+        discrete_dist, a_logits = self.discrete_distribution(state, a_cont_true.detach(), get_logits=True) # detach to avoid gradients of continuous through here
         a_discrete = discrete_dist.rsample()
+
+        # RPL. Add prior policy action (since we are learning a residual policy)        
+        a_cont_combined = None
+        a_logits_combined = None
+        # Check if it is time to start using and training the new residual plocy
+        if (self._start_residual):
+            a_cont_combined = a_cont_true
+            a_logits_combined = a_logits
+        for idx, prior_policy in enumerate(self._prior_policies):
+            _, prior_state =  self._mdp_get_prior_state_fn(state, ik_task=(idx==0)) # prior task policy is from an IK task
+            prior_a_cont, prior_a_logits = prior_policy.draw_action_mean_and_logits(prior_state) # use prior_state for the immediate previous task
+            # Bound the logits
+            prior_a_logits = torch.clamp(prior_a_logits, self._logit_min(), self._logit_max())
+            
+            if (a_cont_combined is not None):
+                a_cont_combined += prior_a_cont
+                a_logits_combined += prior_a_logits
+            else:
+                a_cont_combined = prior_a_cont
+                a_logits_combined = prior_a_logits
+
+        a_discrete_combined = GumbelSoftmax(temperature=self._temperature, logits=a_logits_combined).rsample()
 
         if compute_log_prob:
             # Continuous
@@ -193,9 +237,9 @@ class SAC_hybridPolicy(Policy):
             log_prob_cont -= torch.log(1. - a_cont.pow(2) + self._eps_log_prob).sum(dim=1)
             # Discrete
             log_prob_discrete = discrete_dist.log_prob(a_discrete)
-            return torch.hstack((a_cont_true, a_discrete)), log_prob_cont+log_prob_discrete
+            return torch.hstack((a_cont_combined, a_discrete_combined)), log_prob_cont+log_prob_discrete
         else:
-            return torch.hstack((a_cont_true, a_discrete))
+            return torch.hstack((a_cont_combined, a_discrete_combined))
 
     def cont_distribution(self, state):
         """
@@ -215,7 +259,7 @@ class SAC_hybridPolicy(Policy):
         log_sigma = torch.clamp(log_sigma, self._log_std_min(), self._log_std_max())
         return torch.distributions.Normal(mu, log_sigma.exp())
 
-    def discrete_distribution(self, state, a_cont):
+    def discrete_distribution(self, state, a_cont, get_logits=False):
         """
         Compute the discrete policy distribution (categorical) in the given states.
 
@@ -224,6 +268,7 @@ class SAC_hybridPolicy(Policy):
                 computed.
             a_cont (torch tensor): the set of continuous actions, conditioned on 
                 which, the discrete distribution is computed.
+            get_logits (bool): return the logits of the discrete distribution
 
         Returns:
             The torch distribution for the provided states.
@@ -235,8 +280,13 @@ class SAC_hybridPolicy(Policy):
             else:
                 state = torch.from_numpy(state)
         logits = self._discrete_approximator.predict(torch.hstack((state, a_cont)), output_tensor=True)
+        # Bound the logits
+        logits = torch.clamp(logits, self._logit_min(), self._logit_max())
 
-        return GumbelSoftmax(temperature=self._temperature, logits=logits)
+        if get_logits:
+            return GumbelSoftmax(temperature=self._temperature, logits=logits), logits
+        else:
+            return GumbelSoftmax(temperature=self._temperature, logits=logits)
 
     def entropy(self, state=None):
         """
@@ -312,21 +362,18 @@ class SAC_hybridPolicy(Policy):
                      self._discrete_approximator.model.network.parameters())
 
 
-class SAC_hybrid(DeepAC):
+class RPL(DeepAC):
     """
-    Soft Actor-Critic algorithm.
-    "Soft Actor-Critic Algorithms and Applications".
-    Haarnoja T. et al.. 2019.
-
-    * With a Hybrid action space (A sequential discrete approximator takes as input the continous action and outputs the discrete part of the action)
+    RPL with a Hybrid action space (A sequential discrete approximator takes as input the 
+    continous action and outputs the discrete part of the action)
 
     """
     def __init__(self, mdp_info, actor_mu_params, actor_sigma_params, actor_discrete_params,
                  actor_optimizer, critic_params, batch_size,
                  initial_replay_size, max_replay_size, warmup_transitions, tau,
-                 lr_alpha, log_std_min=-20, log_std_max=2, temperature=1.0, target_entropy=None, 
-                 prior_agents=None, mdp_get_prior_state_fn=None, use_kl_on_q=False, kl_on_q_alpha=1e-3,
-                 use_kl_on_pi=False, kl_on_pi_alpha=1e-3, prior_agent_to_reuse=None, critic_fit_params=None):
+                 lr_alpha, log_std_min=-20, log_std_max=2, temperature=1.0, use_entropy=False, target_entropy=None, 
+                 gauss_noise_cov=0.0, prior_agents=None, mdp_get_prior_state_fn=None, logit_max=2, logit_min=-2,
+                 start_residual=False, critic_fit_params=None):
         """
         Constructor.
 
@@ -353,19 +400,20 @@ class SAC_hybrid(DeepAC):
             log_std_min ([float, Parameter]): Min value for the policy log std;
             log_std_max ([float, Parameter]): Max value for the policy log std;
             temperature (float): the temperature for the softmax part of the gumbel reparametrization
+            use_entropy (bool): Add entropy loss similar to SAC
             target_entropy (float, None): target entropy for the policy, if
                 None a default value is computed ;
+            gauss_noise_cov ([float, Parameter]): Add gaussian noise to the drawn actions (if calling 'draw_noisy_action()');
             prior_agents ([mushroom object]): The agent object from agents trained on prior tasks;
             mdp_get_prior_state_fn (mushroom object): We need the mdp get state function for state-specific filtering to use the prior agents;
-            use_kl_on_q (bool): Whether to use a kl between the prior task policy and the new policy as a reward
-            kl_on_q_alpha (float): Alpha parameter to weight the KL divergence reward
-            use_kl_on_pi (bool): Whether to use a kl between the prior task policy and the new policy as a loss on the policy
-            kl_on_pi_alpha (float): Alpha parameter to weight the KL divergence loss on the policy
-            prior_agent_to_reuse: (Optional) prior agent to continue training with
+            logit_max ([float, Parameter]): Max value for the policy discrete logits
+            logit_min ([float, Parameter]): Min value for the policy discrete logits
+            start_residual (bool): Flag to start using (and training) the residual policy
             critic_fit_params (dict, None): parameters of the fitting algorithm
                 of the critic approximator.
 
         """
+        self._freeze_data = False # Flag to fit critic and policy only and not use any new data
         self._critic_fit_params = dict() if critic_fit_params is None else critic_fit_params
 
         self._batch_size = to_parameter(batch_size)
@@ -385,31 +433,21 @@ class SAC_hybrid(DeepAC):
             critic_params['n_models'] = 2
 
         target_critic_params = deepcopy(critic_params)
-        if(prior_agent_to_reuse is not None):
-            # Continue training with the prior agent's Q function
-            self._critic_approximator = prior_agent_to_reuse._critic_approximator
-            self._target_critic_approximator = prior_agent_to_reuse._target_critic_approximator
-        else:
-            self._critic_approximator = Regressor(TorchApproximator,
+        self._critic_approximator = Regressor(TorchApproximator,
                                               **critic_params)
-            self._target_critic_approximator = Regressor(TorchApproximator,
+        self._target_critic_approximator = Regressor(TorchApproximator,
                                                      **target_critic_params)
         
         self._prior_critic_approximators = list()
-        self._prior_policies = list()
+        prior_policies = list()
         if(prior_agents is not None):
             for prior_agent in prior_agents:
                 self._prior_critic_approximators.append(prior_agent._target_critic_approximator) # The target_critic_approximator object from agents trained on prior tasks
-                self._prior_policies.append(prior_agent.policy) # The policy object from an agent trained on a prior task
+                prior_policies.append(prior_agent.policy) # The policy object from an agent trained on a prior task
         
         self._mdp_get_prior_state_fn = mdp_get_prior_state_fn # The mdp function for state-specific filtering to use the prior agents
 
-        self._use_kl_on_q = use_kl_on_q # Whether to use a kl between the prior task policy and the new policy as a reward
-        self._kl_on_q_alpha = kl_on_q_alpha # Alpha parameter to weight the KL divergence reward
-        self._use_kl_on_pi = use_kl_on_pi # Whether to use a kl between the prior task policy and the new policy as a loss for the new policy
-        self._kl_on_pi_alpha = kl_on_pi_alpha # Alpha parameter to weight the KL divergence loss on the policy
-        self._kl_with_prior = np.array([0.0]) # KL divergence with previous policy (numpy)
-        self._kl_with_prior_t = torch.tensor(0.0) # KL divergence with previous policy (torch)
+        self._use_entropy = use_entropy
 
         actor_mu_approximator = Regressor(TorchApproximator,
                                           **actor_mu_params)
@@ -419,14 +457,20 @@ class SAC_hybrid(DeepAC):
                                              **actor_discrete_params)
         self._actor_last_loss = None # Store actor loss for logging
         
-        policy = SAC_hybridPolicy(actor_mu_approximator,
+        policy = RPLPolicy(actor_mu_approximator,
                            actor_sigma_approximator,
                            actor_discrete_approximator,
                            mdp_info.action_space.low,
                            mdp_info.action_space.high,
                            log_std_min,
                            log_std_max,
-                           temperature)
+                           temperature,
+                           gauss_noise_cov,
+                           prior_policies,
+                           self._mdp_get_prior_state_fn,
+                           logit_max,
+                           logit_min,
+                           start_residual)
 
         self._init_target(self._critic_approximator,
                           self._target_critic_approximator)
@@ -460,39 +504,22 @@ class SAC_hybrid(DeepAC):
         super().__init__(mdp_info, policy, actor_optimizer, policy_parameters)
 
     def fit(self, dataset):
-        self._replay_memory.add(dataset)
+        if not(self._freeze_data): # flag to fit only and not use any new data
+            self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
             state, action, reward, next_state, absorbing, _ = \
                 self._replay_memory.get(self._batch_size())
-
-            if self._use_kl_on_q or self._use_kl_on_pi:
-                # Calculate KL divergence between current policy and previous policy
-                weights, prior_state =  self._mdp_get_prior_state_fn(state, ik_task=(len(self._prior_policies)==1)) # prior task policy is from an IK task
-                weights[weights < 1.0] = 0.0 # Only use prior task weights that are >= 1
-                # Note that policies are not residuals so we only need the KL between the immediate previous task and current task
-                prior_cont_dist = self._prior_policies[-1].cont_distribution(prior_state) # use prior_state and weights for the immediate previous task                
-                curr_cont_dist = self.policy.cont_distribution(state)
-                # Convert to MultivariateNormal distributions (for KL calculation)
-                prior_multiv_cont_dist = torch.distributions.MultivariateNormal(prior_cont_dist.mean, torch.diag_embed(prior_cont_dist.variance))
-                curr_multiv_cont_dist = torch.distributions.MultivariateNormal(curr_cont_dist.mean, torch.diag_embed(curr_cont_dist.variance))
-                # TODO: Add discrete discrete distribution for KL calculation
-                # Use Forward KL instead of reverse KL because prior policy distribution could be peaky
-                self._kl_with_prior_t = torch.tensor(weights, device=prior_cont_dist.mean.device)*torch.distributions.kl.kl_divergence(prior_multiv_cont_dist,curr_multiv_cont_dist)
-                self._kl_with_prior = self._kl_with_prior_t.detach().cpu().numpy()
 
             if self._replay_memory.size > self._warmup_transitions():
                 action_new, log_prob = self.policy.compute_action_and_log_prob_t(state)
                 loss = self._loss(state, action_new, log_prob)
                 self._optimize_actor_parameters(loss)
-                self._update_alpha(log_prob.detach())
+                if self._use_entropy:
+                    self._update_alpha(log_prob.detach())
                 self._actor_last_loss = loss.detach().cpu().numpy() # Store actor loss for logging
 
             q_next = self._next_q(next_state, absorbing)
             q = reward + self.mdp_info.gamma * q_next
-            
-            if self._use_kl_on_q: # Use KL divergence between the previous task policy and new policy as reward
-                q -= self._kl_on_q_alpha*np.clip(self._kl_with_prior, 0.0, 5000.0) # TWEAK: Clip the KL because it can explode
-
 
             self._critic_approximator.fit(state, action, q,
                                           **self._critic_fit_params)
@@ -508,12 +535,11 @@ class SAC_hybrid(DeepAC):
 
         q = torch.min(q_0, q_1)
 
-        if self._use_kl_on_pi:
-            # Add a KL penalty for deviating from previous policy (with gradients)
-            q -= torch.tensor(self._kl_on_pi_alpha, device=q.device)*torch.clip(self._kl_with_prior_t, 0.0, 5000.0) # TWEAK: Clip the KL because it can explode
+        if self._use_entropy:
+            q -= self._alpha * log_prob
 
-        return (self._alpha * log_prob - q).mean()
-
+        return  -q.mean()
+    
     def _update_alpha(self, log_prob):
         alpha_loss = - (self._log_alpha * (log_prob + self._target_entropy)).mean()
         self._alpha_optim.zero_grad()
@@ -536,7 +562,11 @@ class SAC_hybrid(DeepAC):
         a, log_prob_next = self.policy.compute_action_and_log_prob(next_state)
 
         q = self._target_critic_approximator.predict(
-            next_state, a, prediction='min') - self._alpha_np * log_prob_next
+            next_state, a, prediction='min')
+        
+        if self._use_entropy:
+            q -= self._alpha_np * log_prob_next
+
         q *= 1 - absorbing
 
         return q

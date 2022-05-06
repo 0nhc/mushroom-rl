@@ -7,7 +7,8 @@ from .sac_gumbel import SAC_gumbel
 from .sac_hybrid import SAC_hybrid
 from .awac_hybrid import AWAC_hybrid
 from .bhyrl import BHyRL
+from .rpl import RPL
 from .trpo import TRPO
 from .ppo import PPO
 
-__all__ = ['DeepAC', 'A2C', 'DDPG', 'TD3', 'SAC', 'SAC_gumbel', 'SAC_hybrid', 'AWAC_hybrid', 'BHyRL', 'TRPO', 'PPO']
+__all__ = ['DeepAC', 'A2C', 'DDPG', 'TD3', 'SAC', 'SAC_gumbel', 'SAC_hybrid', 'AWAC_hybrid', 'BHyRL', 'RPL', 'TRPO', 'PPO']
