@@ -461,8 +461,8 @@ class BHyRL(DeepAC):
         super().__init__(mdp_info, policy, actor_optimizer, policy_parameters)
 
     def fit(self, dataset):
-        # if not(self._freeze_data): # flag to fit only and not use any new data
-        self._replay_memory.add(dataset)
+        if not(self._freeze_data): # flag to fit only and not use any new data
+            self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
             state, action, reward, next_state, absorbing, _ = \
                 self._replay_memory.get(self._batch_size())
