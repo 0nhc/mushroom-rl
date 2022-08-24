@@ -76,6 +76,9 @@ class SACPolicy(Policy):
         return self.compute_action_and_log_prob_t(
             state, compute_log_prob=False).detach().cpu().numpy()
 
+    def draw_noisy_action(self, state):
+        # Dummy call to draw_action
+        return self.draw_action(state)
     def compute_action_and_log_prob(self, state):
         """
         Function that samples actions using the reparametrization trick and
@@ -270,6 +273,7 @@ class SAC(DeepAC):
                                           **actor_mu_params)
         actor_sigma_approximator = Regressor(TorchApproximator,
                                              **actor_sigma_params)
+        self._actor_last_loss = None # Store actor loss for logging
 
         policy = SACPolicy(actor_mu_approximator,
                            actor_sigma_approximator,
@@ -319,6 +323,7 @@ class SAC(DeepAC):
                 loss = self._loss(state, action_new, log_prob)
                 self._optimize_actor_parameters(loss)
                 self._update_alpha(log_prob.detach())
+                self._actor_last_loss = loss.detach().cpu().numpy() # Store actor loss for logging
 
             q_next = self._next_q(next_state, absorbing)
             q = reward + self.mdp_info.gamma * q_next
