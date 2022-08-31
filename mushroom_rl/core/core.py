@@ -204,24 +204,24 @@ class Core(object):
             of the reached state and the last step flag.
 
         """
-        # # Modifications to use priors in learning:
-        if (learning & self._use_data_prior):
-            if self.mdp.check_prior_condition():    # Data prior
-                # Don't always draw action from policy, instead
-                # bias action selection using prior (with epsilon probability. epsilon can be modified from the main script)            
-                if (self._prior_eps >= np.random.uniform()):
-                    # use sample from prior
-                    action = self.mdp.get_prior_action() # don't need to pass _state. The mdp knows the state
-                    self._prior_sample_count += 1
-                    data_prior_used = True
-                else:
-                    action = self.agent.draw_noisy_action(self._state) # draw noisy action for the behavior policy (+ gaussian noise)
-                    data_prior_used = False
-                # Step environment (mdp)
-                next_state, reward, absorbing, _ = self.mdp.step(action)
-                if (data_prior_used and (reward >=0.5)):
-                    self._prior_success_count += 1
-        elif (learning and self._prior_pretrain_only): # Pretrain Prior
+        # # # Modifications to use priors in learning:
+        # if (learning & self._use_data_prior):
+        #     if self.mdp.check_prior_condition():    # Data prior
+        #         # Don't always draw action from policy, instead
+        #         # bias action selection using prior (with epsilon probability. epsilon can be modified from the main script)            
+        #         if (self._prior_eps >= np.random.uniform()):
+        #             # use sample from prior
+        #             action = self.mdp.get_prior_action() # don't need to pass _state. The mdp knows the state
+        #             self._prior_sample_count += 1
+        #             data_prior_used = True
+        #         else:
+        #             action = self.agent.draw_noisy_action(self._state) # draw noisy action for the behavior policy (+ gaussian noise)
+        #             data_prior_used = False
+        #         # Step environment (mdp)
+        #         next_state, reward, absorbing, _ = self.mdp.step(action)
+        #         if (data_prior_used and (reward >=0.5)):
+        #             self._prior_success_count += 1
+        if (learning and self._prior_pretrain_only): # Pretrain Prior
             self._episode_steps -= 1 # Don't count these samples as episode_steps
             if not(self.agent._replay_memory.initialized):
                 # Generate samples from prior only (without stepping the environment) to
