@@ -385,7 +385,7 @@ class SAC_hybrid(DeepAC):
         
         self._boosting = False # default. Will be set if setup_boosting is called
 
-        self._state_dim = actor_mu_params['input_shape'] # Store state dimensions for help in boosting (change in state spaces)
+        self._state_dim = actor_mu_params['input_shape'][0] # Store state dimensions for help in boosting (change in state spaces)
         actor_mu_approximator = Regressor(TorchApproximator,
                                           **actor_mu_params)
         actor_sigma_approximator = Regressor(TorchApproximator,
@@ -467,7 +467,6 @@ class SAC_hybrid(DeepAC):
                 if self._use_kl_on_pi:
                     # Calculate KL divergence between current policy and previous policy
                     # Note that policies are not residuals so we only need the KL between the immediate previous task and current task
-                    import pdb; pdb.set_trace()
                     prior_state = state[:,0:self._prior_state_dims[-1]]
                     prior_cont_dist = self._prior_policies[-1].cont_distribution(prior_state) # use prior_state for the immediate previous task
                     curr_cont_dist = self.policy.cont_distribution(state)
