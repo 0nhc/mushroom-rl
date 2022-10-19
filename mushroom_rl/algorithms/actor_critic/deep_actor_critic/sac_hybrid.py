@@ -324,9 +324,8 @@ class SAC_hybrid(DeepAC):
     def __init__(self, mdp_info, actor_mu_params, actor_sigma_params, actor_discrete_params,
                  actor_optimizer, critic_params, batch_size,
                  initial_replay_size, max_replay_size, warmup_transitions, tau,
-                 lr_alpha, log_std_min=-20, log_std_max=2, temperature=1.0, target_entropy=None, 
-                 prior_agents=None, mdp_get_prior_state_fn=None, use_kl_on_q=False, kl_on_q_alpha=1e-3,
-                 use_kl_on_pi=False, kl_on_pi_alpha=1e-3, prior_agent_to_reuse=None, critic_fit_params=None):
+                 lr_alpha, log_std_min=-20, log_std_max=2, temperature=1.0, target_entropy=None,
+                 critic_fit_params=None):
         """
         Constructor.
 
@@ -355,13 +354,6 @@ class SAC_hybrid(DeepAC):
             temperature (float): the temperature for the softmax part of the gumbel reparametrization
             target_entropy (float, None): target entropy for the policy, if
                 None a default value is computed ;
-            prior_agents ([mushroom object]): The agent object from agents trained on prior tasks;
-            mdp_get_prior_state_fn (mushroom object): We need the mdp get state function for state-specific filtering to use the prior agents;
-            use_kl_on_q (bool): Whether to use a kl between the prior task policy and the new policy as a reward
-            kl_on_q_alpha (float): Alpha parameter to weight the KL divergence reward
-            use_kl_on_pi (bool): Whether to use a kl between the prior task policy and the new policy as a loss on the policy
-            kl_on_pi_alpha (float): Alpha parameter to weight the KL divergence loss on the policy
-            prior_agent_to_reuse: (Optional) prior agent to continue training with
             critic_fit_params (dict, None): parameters of the fitting algorithm
                 of the critic approximator.
 
@@ -385,32 +377,15 @@ class SAC_hybrid(DeepAC):
             critic_params['n_models'] = 2
 
         target_critic_params = deepcopy(critic_params)
-        if(prior_agent_to_reuse is not None):
-            # Continue training with the prior agent's Q function
-            self._critic_approximator = prior_agent_to_reuse._critic_approximator
-            self._target_critic_approximator = prior_agent_to_reuse._target_critic_approximator
-        else:
-            self._critic_approximator = Regressor(TorchApproximator,
-                                              **critic_params)
-            self._target_critic_approximator = Regressor(TorchApproximator,
-                                                     **target_critic_params)
-        
-        self._prior_critic_approximators = list()
-        self._prior_policies = list()
-        if(prior_agents is not None):
-            for prior_agent in prior_agents:
-                self._prior_critic_approximators.append(prior_agent._target_critic_approximator) # The target_critic_approximator object from agents trained on prior tasks
-                self._prior_policies.append(prior_agent.policy) # The policy object from an agent trained on a prior task
-        
-        self._mdp_get_prior_state_fn = mdp_get_prior_state_fn # The mdp function for state-specific filtering to use the prior agents
 
-        self._use_kl_on_q = use_kl_on_q # Whether to use a kl between the prior task policy and the new policy as a reward
-        self._kl_on_q_alpha = kl_on_q_alpha # Alpha parameter to weight the KL divergence reward
-        self._use_kl_on_pi = use_kl_on_pi # Whether to use a kl between the prior task policy and the new policy as a loss for the new policy
-        self._kl_on_pi_alpha = kl_on_pi_alpha # Alpha parameter to weight the KL divergence loss on the policy
-        self._kl_with_prior = np.array([0.0]) # KL divergence with previous policy (numpy)
-        self._kl_with_prior_t = torch.tensor(0.0) # KL divergence with previous policy (torch)
+        self._critic_approximator = Regressor(TorchApproximator,
+                                            **critic_params)
+        self._target_critic_approximator = Regressor(TorchApproximator,
+                                                    **target_critic_params)
+        
+        self._boosting = False # default. Will be set if setup_boosting is called
 
+        self._state_dim = actor_mu_params['input_shape'] # Store state dimensions for help in boosting (change in state spaces)
         actor_mu_approximator = Regressor(TorchApproximator,
                                           **actor_mu_params)
         actor_sigma_approximator = Regressor(TorchApproximator,
@@ -453,11 +428,34 @@ class SAC_hybrid(DeepAC):
             _replay_memory='mushroom',
             _critic_approximator='mushroom',
             _target_critic_approximator='mushroom',
+            _boosting='primitive',
+            _state_dim='primitive',
             _log_alpha='torch',
             _alpha_optim='torch'
         )
 
         super().__init__(mdp_info, policy, actor_optimizer, policy_parameters)
+
+    def setup_boosting(self, prior_agents, use_kl_on_pi=False, kl_on_pi_alpha=1e-3):
+        """
+            prior_agents ([mushroom object list]): The agent object from agents trained on prior tasks;
+            use_kl_on_pi (bool): Whether to use a kl between the prior task policy and the new policy as a loss on the policy
+            kl_on_pi_alpha (float): Alpha parameter to weight the KL divergence loss on the policy
+        """
+        self._boosting = True
+        self._prior_critic_approximators = list()
+        self._prior_policies = list()
+        self._prior_state_dims = list()
+        for prior_agent in prior_agents:
+            self._prior_critic_approximators.append(prior_agent._target_critic_approximator) # The target_critic_approximator object from agents trained on prior tasks
+            self._prior_policies.append(prior_agent.policy) # The policy object from an agent trained on a prior task
+            self._prior_state_dims.append(prior_agent._state_dim)
+        # self._use_kl_on_q = use_kl_on_q # Whether to use a kl between the prior task policy and the new policy as a reward
+        # self._kl_on_q_alpha = kl_on_q_alpha # Alpha parameter to weight the KL divergence reward
+        self._use_kl_on_pi = use_kl_on_pi # Whether to use a kl between the prior task policy and the new policy as a loss for the new policy
+        self._kl_on_pi_alpha = kl_on_pi_alpha # Alpha parameter to weight the KL divergence loss on the policy
+        self._kl_with_prior = np.array([0.0]) # KL divergence with previous policy (numpy)
+        self._kl_with_prior_t = torch.tensor(0.0) # KL divergence with previous policy (torch)
 
     def fit(self, dataset):
         self._replay_memory.add(dataset)
@@ -465,20 +463,21 @@ class SAC_hybrid(DeepAC):
             state, action, reward, next_state, absorbing, _ = \
                 self._replay_memory.get(self._batch_size())
 
-            if self._use_kl_on_q or self._use_kl_on_pi:
-                # Calculate KL divergence between current policy and previous policy
-                weights, prior_state =  self._mdp_get_prior_state_fn(state, ik_task=(len(self._prior_policies)==1)) # prior task policy is from an IK task
-                weights[weights < 1.0] = 0.0 # Only use prior task weights that are >= 1
-                # Note that policies are not residuals so we only need the KL between the immediate previous task and current task
-                prior_cont_dist = self._prior_policies[-1].cont_distribution(prior_state) # use prior_state and weights for the immediate previous task                
-                curr_cont_dist = self.policy.cont_distribution(state)
-                # Convert to MultivariateNormal distributions (for KL calculation)
-                prior_multiv_cont_dist = torch.distributions.MultivariateNormal(prior_cont_dist.mean, torch.diag_embed(prior_cont_dist.variance))
-                curr_multiv_cont_dist = torch.distributions.MultivariateNormal(curr_cont_dist.mean, torch.diag_embed(curr_cont_dist.variance))
-                # TODO: Add discrete discrete distribution for KL calculation
-                # Use Forward KL instead of reverse KL because prior policy distribution could be peaky
-                self._kl_with_prior_t = torch.tensor(weights, device=prior_cont_dist.mean.device)*torch.distributions.kl.kl_divergence(prior_multiv_cont_dist,curr_multiv_cont_dist)
-                self._kl_with_prior = self._kl_with_prior_t.detach().cpu().numpy()
+            if self._boosting:
+                if self._use_kl_on_pi:
+                    # Calculate KL divergence between current policy and previous policy
+                    # Note that policies are not residuals so we only need the KL between the immediate previous task and current task
+                    import pdb; pdb.set_trace()
+                    prior_state = state[:,0:self._prior_state_dims[-1]]
+                    prior_cont_dist = self._prior_policies[-1].cont_distribution(prior_state) # use prior_state for the immediate previous task
+                    curr_cont_dist = self.policy.cont_distribution(state)
+                    # Convert to MultivariateNormal distributions (for KL calculation)
+                    prior_multiv_cont_dist = torch.distributions.MultivariateNormal(prior_cont_dist.mean, torch.diag_embed(prior_cont_dist.variance))
+                    curr_multiv_cont_dist = torch.distributions.MultivariateNormal(curr_cont_dist.mean, torch.diag_embed(curr_cont_dist.variance))
+                    # TODO: Add discrete discrete distribution for KL calculation
+                    # Use Forward KL instead of reverse KL because prior policy distribution could be peaky
+                    self._kl_with_prior_t = torch.distributions.kl.kl_divergence(prior_multiv_cont_dist,curr_multiv_cont_dist)
+                    self._kl_with_prior = self._kl_with_prior_t.detach().cpu().numpy()
 
             if self._replay_memory.size > self._warmup_transitions():
                 action_new, log_prob = self.policy.compute_action_and_log_prob_t(state)
@@ -490,10 +489,6 @@ class SAC_hybrid(DeepAC):
             q_next = self._next_q(next_state, absorbing)
             q = reward + self.mdp_info.gamma * q_next
             
-            if self._use_kl_on_q: # Use KL divergence between the previous task policy and new policy as reward
-                q -= self._kl_on_q_alpha*np.clip(self._kl_with_prior, 0.0, 5000.0) # TWEAK: Clip the KL because it can explode
-
-
             self._critic_approximator.fit(state, action, q,
                                           **self._critic_fit_params)
 
@@ -508,9 +503,10 @@ class SAC_hybrid(DeepAC):
 
         q = torch.min(q_0, q_1)
 
-        if self._use_kl_on_pi:
-            # Add a KL penalty for deviating from previous policy (with gradients)
-            q -= torch.tensor(self._kl_on_pi_alpha, device=q.device)*torch.clip(self._kl_with_prior_t, 0.0, 5000.0) # TWEAK: Clip the KL because it can explode
+        if self._boosting:
+            if self._use_kl_on_pi:
+                # Add a KL penalty for deviating from previous policy (with gradients)
+                q -= torch.tensor(self._kl_on_pi_alpha, device=q.device)*torch.clip(self._kl_with_prior_t, 0.0, 5000.0) # TWEAK: Clip the KL because it can explode
 
         return (self._alpha * log_prob - q).mean()
 
