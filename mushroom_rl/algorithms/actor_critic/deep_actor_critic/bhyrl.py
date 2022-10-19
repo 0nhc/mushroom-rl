@@ -326,7 +326,7 @@ class BHyRL(DeepAC):
     def __init__(self, mdp_info, actor_mu_params, actor_sigma_params, actor_discrete_params,
                  actor_optimizer, critic_params, batch_size,
                  initial_replay_size, max_replay_size, warmup_transitions, tau,
-                 lr_alpha, log_std_min=-20, log_std_max=2, temperature=1.0, use_entropy=False, target_entropy=None,
+                 lr_alpha, log_std_min=-3, log_std_max=2, temperature=1.0, use_entropy=False, target_entropy=None,
                  gauss_noise_cov=0.01, critic_fit_params=None):
         """
         Constructor.
