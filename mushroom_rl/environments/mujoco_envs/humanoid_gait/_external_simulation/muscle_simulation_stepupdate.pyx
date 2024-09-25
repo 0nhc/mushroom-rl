@@ -21,7 +21,7 @@ cpdef tuple step_update_state(float frcmax, float vmax, float eref, float lslack
                               np.ndarray[np.float_t, ndim=1] phimaxref, np.ndarray[np.float_t, ndim=1] rho,
                               np.ndarray[np.float_t, ndim=1] dirAng, np.ndarray[np.float_t, ndim=1] phiScale,
                               np.ndarray[np.float_t, ndim=1] angJoi, np.ndarray[np.float_t, ndim=1] levelArm,
-                              np.ndarray[np.int_t, ndim=1] offsetCorr,
+                              np.ndarray[np.int32_t, ndim=1] offsetCorr,
                               float timestep, float MR, int typeMuscle,
                               float lse, float Lse, float Lce, float actsubstep,
                               float lcesubstep, float lce_avg, float vce_avg, float frcmtc_avg, float act_avg, int frame):
